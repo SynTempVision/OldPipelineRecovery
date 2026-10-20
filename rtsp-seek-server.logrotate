@@ -1,0 +1,8 @@
+/var/log/rtsp-seek-server.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    create 0644 root root
+}

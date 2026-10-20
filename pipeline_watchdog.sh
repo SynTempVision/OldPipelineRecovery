@@ -1,50 +1,94 @@
 #!/bin/bash
-# pipeline_watchdog.sh - actively monitors rtsp-seek-server/rtsp-ir-server
-# for the "alive but stuck" failure mode that the old while-loop can't
-# catch (no exit event to react to). Reuses camera-check-v2.sh's own
-# proven detection logic rather than inventing new checks - confirmed
-# against two real broken examples (sv-191, sv-200, 2026-10-20).
+# pipeline_watchdog.sh - actively monitors the old pipeline (rtsp-seek-
+# server/rtsp-ir-server) AND imgserv for the "alive but stuck/down"
+# failure modes nothing else catches automatically. Confirmed live
+# against two real broken cameras (sv-191, sv-200, 2026-10-20).
 #
-# DELIBERATELY additive only: this does NOT replace the pipeline's normal
-# startup (system_init.sh and the existing wrapper scripts are untouched)
-# and does NOT reimplement pipeline_restart.sh's own logic - it just
-# calls that already-working script when it detects a problem. To remove
-# this watchdog entirely, just stop/remove this one process; nothing else
-# about the camera's setup needs to change.
+# DELIBERATELY additive only: system_init.sh and the existing pipeline/
+# imgserv startup lines are untouched. This script only detects problems
+# and calls the camera's own already-working fix scripts
+# (pipeline_restart.sh, restart_imgserv.sh) - no reimplementation of
+# startup logic, no systemd takeover of anything. Removing this watchdog
+# is just stopping one process; nothing else needs to change.
+#
+# Two independent check loops, different intervals since the two checks
+# have very different cost: imgserv's port check is cheap (a few ms), so
+# it runs every tick (5s) for fast reaction; image.pgm/USB checks are
+# heavier (stat/md5sum/dmesg scan) and run every 6th tick (30s). Each has
+# its own debounce + circuit breaker - they're unrelated failure domains,
+# so one shouldn't affect the other's state.
 
-RESTART_SCRIPT="/usr/local/bin/camera/pipeline_restart.sh"
+PIPELINE_RESTART_SCRIPT="/usr/local/bin/camera/pipeline_restart.sh"
+IMGSERV_RESTART_SCRIPT="/usr/local/bin/camera/restart_imgserv.sh"
 RAMDISK="/usr/local/bin/camera/ramdisk/image.pgm"
 MIN_BYTES=1000          # same threshold as camera-check-v2.sh
 STALE_SECS=60           # same threshold as camera-check-v2.sh
-CHECK_INTERVAL=30
+
+TICK_INTERVAL=5                                              # base loop tick
+PIPELINE_TICKS_PER_CHECK=6                                    # 6 * 5s = 30s for the heavier checks
 GRACE_PERIOD=120
 USB_ERR_THRESHOLD=5
 REPEAT_THRESHOLD=2       # consecutive identical hashes = frozen at pixel level
-BAD_STATE_THRESHOLD=2    # consecutive MISSING/EMPTY/STALE checks before acting - filters a one-off blip
+BAD_STATE_THRESHOLD=2    # consecutive MISSING/EMPTY/STALE checks before acting
+IMGSERV_BAD_THRESHOLD=2  # consecutive down-port checks before acting (~10s of real downtime)
 MAX_RESTARTS=3           # circuit breaker: stop auto-restarting after this many...
 RESTART_WINDOW_SECS=1800 # ...within this time window (30 min) - needs a human instead
 
-# Starts equal to "now," not 0 - a camera/watchdog that just booted needs
-# the same grace period a just-triggered restart gets, otherwise the
-# watchdog would start judging image.pgm before the pipeline has even had
-# a chance to produce its first real frame.
-LAST_RESTART_EPOCH=$(date +%s)
+# Both start equal to "now," not 0 - a watchdog that just started needs
+# the same grace period a just-triggered restart gets, otherwise it'd
+# judge things before the pipeline/imgserv have had a chance to come up.
+LAST_PIPELINE_RESTART_EPOCH=$(date +%s)
+LAST_IMGSERV_RESTART_EPOCH=$(date +%s)
 LAST_HASH=""
 REPEAT_COUNT=0
 BAD_STATE_COUNT=0
-RESTART_HISTORY=()   # epoch timestamps of recent restarts, for the circuit breaker
+IMGSERV_BAD_COUNT=0
+PIPELINE_RESTART_HISTORY=()
+IMGSERV_RESTART_HISTORY=()
 
+TICK=0
 while true; do
-    sleep "$CHECK_INTERVAL"
+    sleep "$TICK_INTERVAL"
+    TICK=$((TICK + 1))
     NOW=$(date +%s)
-    [ $((NOW - LAST_RESTART_EPOCH)) -lt "$GRACE_PERIOD" ] && continue
+
+    # ---------------- imgserv check (every tick, ~5s) ----------------
+    if [ $((NOW - LAST_IMGSERV_RESTART_EPOCH)) -ge "$GRACE_PERIOD" ]; then
+        if ! ss -tln 2>/dev/null | grep -q ":2105 "; then
+            IMGSERV_BAD_COUNT=$((IMGSERV_BAD_COUNT + 1))
+        else
+            IMGSERV_BAD_COUNT=0
+        fi
+
+        if [ "$IMGSERV_BAD_COUNT" -ge "$IMGSERV_BAD_THRESHOLD" ]; then
+            PRUNED=()
+            for ts in "${IMGSERV_RESTART_HISTORY[@]}"; do
+                [ $((NOW - ts)) -lt "$RESTART_WINDOW_SECS" ] && PRUNED+=("$ts")
+            done
+            IMGSERV_RESTART_HISTORY=("${PRUNED[@]}")
+
+            if [ "${#IMGSERV_RESTART_HISTORY[@]}" -ge "$MAX_RESTARTS" ]; then
+                echo "$(date -Iseconds) WATCHDOG: CIRCUIT BREAKER - imgserv restarted ${#IMGSERV_RESTART_HISTORY[@]}x in ${RESTART_WINDOW_SECS}s, not retrying automatically. Needs a human." | sudo tee -a /var/log/pipeline_watchdog.log
+            else
+                echo "$(date -Iseconds) WATCHDOG: running $IMGSERV_RESTART_SCRIPT - reason: port 2105 down (${IMGSERV_BAD_COUNT}x consecutive)" | sudo tee -a /var/log/pipeline_watchdog.log
+                sudo bash "$IMGSERV_RESTART_SCRIPT"
+                IMGSERV_RESTART_HISTORY+=("$NOW")
+                LAST_IMGSERV_RESTART_EPOCH="$NOW"
+            fi
+            IMGSERV_BAD_COUNT=0
+        fi
+    fi
+
+    # -------- pipeline / image.pgm / USB checks (every 30s) --------
+    [ $((TICK % PIPELINE_TICKS_PER_CHECK)) -ne 0 ] && continue
+    [ $((NOW - LAST_PIPELINE_RESTART_EPOCH)) -lt "$GRACE_PERIOD" ] && continue
 
     REASON=""
     BAD_STATE=0
 
     # Layer 1: does the file even exist / have real data (catches the
-    # sv-191 case - this must run FIRST, before any pixel-level check,
-    # since a tiny header-only file can fool a variance check)
+    # sv-191 case - must run FIRST, before any pixel-level check, since
+    # a tiny header-only file can fool a variance check)
     if [ ! -f "$RAMDISK" ]; then
         REASON="image.pgm MISSING"
         BAD_STATE=1
@@ -61,9 +105,7 @@ while true; do
             else
                 # Layer 2: frozen-at-pixel-level via hash comparison across
                 # polls (catches a real frame stuck re-writing the same
-                # buffer, even while mtime keeps advancing). Already
-                # self-debounced via REPEAT_THRESHOLD, same idea as the
-                # BAD_STATE debounce below just pre-existing.
+                # buffer, even while mtime keeps advancing).
                 HASH=$(md5sum "$RAMDISK" 2>/dev/null | cut -d' ' -f1)
                 if [ -n "$HASH" ] && [ "$HASH" = "$LAST_HASH" ]; then
                     REPEAT_COUNT=$((REPEAT_COUNT + 1))
@@ -80,8 +122,8 @@ while true; do
 
     # MISSING/EMPTY/STALE debounce - require the same kind of bad reading
     # on consecutive checks before acting, so a single noisy/transient
-    # check doesn't trigger an unnecessary restart of an otherwise-healthy
-    # pipeline. REPEATING already has its own equivalent debounce above.
+    # check doesn't trigger an unnecessary restart. REPEATING already has
+    # its own equivalent debounce above.
     if [ "$BAD_STATE" -eq 1 ]; then
         BAD_STATE_COUNT=$((BAD_STATE_COUNT + 1))
         if [ "$BAD_STATE_COUNT" -lt "$BAD_STATE_THRESHOLD" ]; then
@@ -93,29 +135,26 @@ while true; do
 
     # Layer 3: kernel/USB error spam (won't catch sv-191/sv-200's case,
     # but does catch the sv-31-style failure - different failure mode,
-    # same action). Already self-debounced by the >=5-in-2000-lines
-    # threshold itself, no extra consecutive-check logic needed here.
+    # same action). Self-debounced by the >=5-in-2000-lines threshold.
     USB_ERRS=$(dmesg | tail -2000 | grep -cE "usb.*error|cannot enumerate|device not accepting|usbdevfs_control failed|did not claim interface|usb disconnect|attempt power cycle|unable to enumerate")
     if [ "$USB_ERRS" -ge "$USB_ERR_THRESHOLD" ]; then
         REASON="${REASON:+$REASON, }usb_errors ($USB_ERRS)"
     fi
 
     if [ -n "$REASON" ]; then
-        # Circuit breaker - prune restart history older than the window,
-        # then check if we're already at the limit before acting again.
         PRUNED=()
-        for ts in "${RESTART_HISTORY[@]}"; do
+        for ts in "${PIPELINE_RESTART_HISTORY[@]}"; do
             [ $((NOW - ts)) -lt "$RESTART_WINDOW_SECS" ] && PRUNED+=("$ts")
         done
-        RESTART_HISTORY=("${PRUNED[@]}")
+        PIPELINE_RESTART_HISTORY=("${PRUNED[@]}")
 
-        if [ "${#RESTART_HISTORY[@]}" -ge "$MAX_RESTARTS" ]; then
-            echo "$(date -Iseconds) WATCHDOG: CIRCUIT BREAKER - ${#RESTART_HISTORY[@]} restarts in the last ${RESTART_WINDOW_SECS}s, not restarting again automatically. Needs a human. Last reason: $REASON" | sudo tee -a /var/log/pipeline_watchdog.log
+        if [ "${#PIPELINE_RESTART_HISTORY[@]}" -ge "$MAX_RESTARTS" ]; then
+            echo "$(date -Iseconds) WATCHDOG: CIRCUIT BREAKER - pipeline restarted ${#PIPELINE_RESTART_HISTORY[@]}x in ${RESTART_WINDOW_SECS}s, not retrying automatically. Needs a human. Last reason: $REASON" | sudo tee -a /var/log/pipeline_watchdog.log
         else
-            echo "$(date -Iseconds) WATCHDOG: running $RESTART_SCRIPT - reason: $REASON" | sudo tee -a /var/log/pipeline_watchdog.log
-            sudo bash "$RESTART_SCRIPT"
-            RESTART_HISTORY+=("$NOW")
-            LAST_RESTART_EPOCH="$NOW"
+            echo "$(date -Iseconds) WATCHDOG: running $PIPELINE_RESTART_SCRIPT - reason: $REASON" | sudo tee -a /var/log/pipeline_watchdog.log
+            sudo bash "$PIPELINE_RESTART_SCRIPT"
+            PIPELINE_RESTART_HISTORY+=("$NOW")
+            LAST_PIPELINE_RESTART_EPOCH="$NOW"
             REPEAT_COUNT=0
             BAD_STATE_COUNT=0
         fi

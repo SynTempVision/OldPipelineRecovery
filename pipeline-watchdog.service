@@ -2,18 +2,18 @@
 #
 # Runs pipeline_watchdog.sh persistently and restarts IT if it crashes -
 # this is the only thing systemd supervises here. The watchdog script
-# itself calls pipeline_restart.sh (the already-existing, already-proven
-# recovery action) when it detects a problem - it does NOT replace or
-# depend on any systemd unit for the pipeline/imgserv themselves, since
-# those are deliberately left on their existing system_init.sh-based
-# startup, untouched.
+# itself calls pipeline_restart.sh and restart_imgserv.sh (the already-
+# existing, already-proven recovery actions) when it detects a problem -
+# it does NOT replace or depend on any systemd unit for the pipeline or
+# imgserv themselves, since those are deliberately left on their existing
+# system_init.sh-based startup, untouched.
 #
 # This is purely additive: nothing existing depends on this unit, so
 # disabling/removing it reverts the camera to exactly its original
 # behavior with no other changes needed.
 
 [Unit]
-Description=Pipeline watchdog (frame/USB health monitor, calls pipeline_restart.sh on detection)
+Description=Pipeline + imgserv watchdog (calls pipeline_restart.sh / restart_imgserv.sh on detection)
 After=network.target
 
 [Service]

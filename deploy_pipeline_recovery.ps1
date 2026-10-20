@@ -1,19 +1,17 @@
 # ================================================================
-# deploy_pipeline_recovery.ps1 - Deploy the pipeline recovery set
-# (imgserv.service, pipeline-watchdog.service, pipeline_watchdog.sh) to
-# a camera.
+# deploy_pipeline_recovery.ps1 - Deploy the pipeline recovery set to a
+# camera: pipeline_watchdog.sh, pipeline-watchdog.service, the three
+# logrotate configs, and restart_imgserv.sh (pulled from its real home
+# at deploy\ImgservRestart\ - the watchdog depends on it being present).
 #
-# No Seek-vs-Boson detection needed anymore - pipeline_watchdog.sh calls
-# the camera's own existing pipeline_restart.sh when it detects a
-# problem, and that script already knows how to restart whichever
-# pipeline is actually installed. Same 3 files work on either camera
-# type unchanged.
+# No Seek-vs-Boson detection needed - pipeline_watchdog.sh calls the
+# camera's own existing pipeline_restart.sh when it detects a problem,
+# and that script already knows how to restart whichever pipeline is
+# actually installed. Same files work on either camera type unchanged.
 #
-# SAFETY: this installs imgserv.service and pipeline-watchdog.service but
-# does NOT enable/start them, and does NOT touch system_init.sh or the
-# existing pipeline wrapper scripts at all - this is purely additive.
-# Enabling the units (and, separately, deciding whether to cut imgserv
-# over from its old startup line) is a deliberate manual step.
+# SAFETY: purely additive. Does NOT touch system_init.sh or the existing
+# pipeline/imgserv wrapper scripts at all. Installs pipeline-watchdog.service
+# but does not enable/start it - that's a deliberate manual step.
 #
 # Usage:
 #   .\deploy_pipeline_recovery.ps1 -Camera sv-191
@@ -29,11 +27,15 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptDir   = $PSScriptRoot
-$CamerasJson = "$PSScriptRoot\..\SiteCameraChecks\cameras.json"
+$ScriptDir      = $PSScriptRoot
+$CamerasJson    = "$PSScriptRoot\..\SiteCameraChecks\cameras.json"
+$ImgservRestart = "$PSScriptRoot\..\deploy\ImgservRestart\restart_imgserv.sh"
 
 if ($Camera -eq "" -and $IP -eq "") {
     Write-Host "ERROR: must supply -Camera <name> or -IP <address>" -ForegroundColor Red; exit 1
+}
+if (-not (Test-Path $ImgservRestart)) {
+    Write-Host "ERROR: restart_imgserv.sh not found at $ImgservRestart" -ForegroundColor Red; exit 1
 }
 
 if ($IP -ne "") {
@@ -60,10 +62,12 @@ Write-Host ""
 
 if ($Preview) {
     Write-Host "Preview only - would:" -ForegroundColor Yellow
-    Write-Host "  1. Copy imgserv.service, pipeline-watchdog.service, pipeline_watchdog.sh to $($target.ip):~/" -ForegroundColor Yellow
-    Write-Host "  2. sudo mv the two .service files into /etc/systemd/system/, pipeline_watchdog.sh into /usr/local/bin/camera/ (chmod +x)" -ForegroundColor Yellow
-    Write-Host "  3. sudo systemctl daemon-reload" -ForegroundColor Yellow
-    Write-Host "  (units are installed but NOT enabled/started; system_init.sh and the existing pipeline wrapper are NOT touched at all)" -ForegroundColor Yellow
+    Write-Host "  1. Copy pipeline_watchdog.sh, pipeline-watchdog.service, restart_imgserv.sh, and 3 logrotate configs to $($target.ip):~/" -ForegroundColor Yellow
+    Write-Host "  2. sudo mv pipeline-watchdog.service into /etc/systemd/system/" -ForegroundColor Yellow
+    Write-Host "  3. sudo mv pipeline_watchdog.sh and restart_imgserv.sh into /usr/local/bin/camera/ (chmod +x both)" -ForegroundColor Yellow
+    Write-Host "  4. sudo mv the 3 logrotate configs into /etc/logrotate.d/" -ForegroundColor Yellow
+    Write-Host "  5. sudo systemctl daemon-reload" -ForegroundColor Yellow
+    Write-Host "  (pipeline-watchdog.service is installed but NOT enabled/started; system_init.sh and the existing wrappers are NOT touched)" -ForegroundColor Yellow
     exit
 }
 
@@ -71,29 +75,42 @@ $SshOpts = @("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=NUL")
 
 $status = "OK"
 try {
-    Write-Host "[1/3] Copying files to home directory..." -ForegroundColor Yellow
-    & scp @SshOpts "$ScriptDir\imgserv.service" "$ScriptDir\pipeline-watchdog.service" "$ScriptDir\pipeline_watchdog.sh" "$($target.user)@$($target.ip):~/"
+    Write-Host "[1/4] Copying files to home directory..." -ForegroundColor Yellow
+    & scp @SshOpts `
+        "$ScriptDir\pipeline_watchdog.sh" `
+        "$ScriptDir\pipeline-watchdog.service" `
+        "$ImgservRestart" `
+        "$ScriptDir\pipeline_watchdog.logrotate" `
+        "$ScriptDir\rtsp-seek-server.logrotate" `
+        "$ScriptDir\rtsp-ir-server.logrotate" `
+        "$($target.user)@$($target.ip):~/"
     if ($LASTEXITCODE -ne 0) { throw "scp failed (exit $LASTEXITCODE)" }
     Write-Host "      OK" -ForegroundColor Green
 
-    Write-Host "[2/3] Moving units + script into place..." -ForegroundColor Yellow
-    $moveCmd = "sudo mv ~/imgserv.service ~/pipeline-watchdog.service /etc/systemd/system/ && " +
-               "sudo mv ~/pipeline_watchdog.sh /usr/local/bin/camera/pipeline_watchdog.sh && " +
-               "sudo chmod +x /usr/local/bin/camera/pipeline_watchdog.sh"
+    Write-Host "[2/4] Moving service unit into place..." -ForegroundColor Yellow
+    & ssh @SshOpts "$($target.user)@$($target.ip)" "sudo mv ~/pipeline-watchdog.service /etc/systemd/system/"
+    if ($LASTEXITCODE -ne 0) { throw "move failed (exit $LASTEXITCODE)" }
+    Write-Host "      OK" -ForegroundColor Green
+
+    Write-Host "[3/4] Moving scripts + logrotate configs into place..." -ForegroundColor Yellow
+    $moveCmd = "sudo mv ~/pipeline_watchdog.sh ~/restart_imgserv.sh /usr/local/bin/camera/ && " +
+               "sudo chmod +x /usr/local/bin/camera/pipeline_watchdog.sh /usr/local/bin/camera/restart_imgserv.sh && " +
+               "sudo mv ~/pipeline_watchdog.logrotate /etc/logrotate.d/pipeline_watchdog && " +
+               "sudo mv ~/rtsp-seek-server.logrotate /etc/logrotate.d/rtsp-seek-server && " +
+               "sudo mv ~/rtsp-ir-server.logrotate /etc/logrotate.d/rtsp-ir-server"
     & ssh @SshOpts "$($target.user)@$($target.ip)" $moveCmd
     if ($LASTEXITCODE -ne 0) { throw "move/chmod failed (exit $LASTEXITCODE)" }
     Write-Host "      OK" -ForegroundColor Green
 
-    Write-Host "[3/3] Reloading systemd..." -ForegroundColor Yellow
+    Write-Host "[4/4] Reloading systemd..." -ForegroundColor Yellow
     & ssh @SshOpts "$($target.user)@$($target.ip)" "sudo systemctl daemon-reload"
     if ($LASTEXITCODE -ne 0) { throw "daemon-reload failed (exit $LASTEXITCODE)" }
     Write-Host "      OK" -ForegroundColor Green
 
     Write-Host ""
-    Write-Host "      Done - units installed, NOT enabled/started. Nothing existing was touched." -ForegroundColor Yellow
-    Write-Host "      To actually turn these on:" -ForegroundColor Yellow
+    Write-Host "      Done - files installed, service NOT enabled/started. Nothing existing was touched." -ForegroundColor Yellow
+    Write-Host "      To actually turn it on:" -ForegroundColor Yellow
     Write-Host "        sudo systemctl enable --now pipeline-watchdog.service" -ForegroundColor Yellow
-    Write-Host "        (imgserv.service cutover is separate - see deploy_imgserv_service.ps1's own notes)" -ForegroundColor Yellow
 }
 catch {
     Write-Host "  FAILED: $_" -ForegroundColor Red
