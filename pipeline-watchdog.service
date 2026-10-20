@@ -1,0 +1,21 @@
+# /etc/systemd/system/pipeline-watchdog.service
+#
+# Runs pipeline_watchdog.sh persistently. Polling is unavoidable here
+# (unlike imgserv.service, there's no "process exit" event for a stuck-
+# but-alive pipeline to react to) - this is what creates that exit event
+# when needed, by calling `systemctl restart rtsp-seek-server.service`.
+
+[Unit]
+Description=Pipeline watchdog (frame/USB health monitor for rtsp-seek-server)
+After=rtsp-seek-server.service
+Requires=rtsp-seek-server.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/camera/pipeline_watchdog.sh
+Restart=on-failure
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
