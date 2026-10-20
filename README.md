@@ -8,7 +8,7 @@ new pipeline's self-recovery behavior as closely as practical.
 | Failure mode | Fix | Automated today? |
 |---|---|---|
 | Clean process exit | `usbreset` + restart | Yes — `rtsp-seek-server.sh`'s own while-loop |
-| Hang / continuous error-loop without exit (the common real-world case — sv-31, sv-139, sv-159) | kill + `pipeline_restart.sh` | Not reliably — depends on periodic external health-check, which doesn't always catch it (sv-31 stuck 8+ days, recovery loop never fired) |
+| Hang / continuous error-loop without exit (the common real-world case — sv-31, sv-139, sv-159, and confirmed live on sv-191/sv-200 today) | `pipeline_restart.sh` (already existed) | **Watchdog built this session** — see below; not yet deployed/enabled anywhere |
 | imgserv dies (separate process from the main pipeline) | restart imgserv, clearing a stale `/run/imgserv.pid` first | **Fixed this session** — see below |
 | USB instability (>=5 resets/errors) | reboot | No — warning only, reboot is always manual |
 | Full USB enumeration failure at boot (hardware-level) | reboot, sometimes physical | No |
@@ -40,24 +40,24 @@ for `restart_imgserv.sh`): disable the old `imgserv -p 2105 &` line in `system_i
 unit, `systemctl enable --now imgserv`, then confirm it survives a manual `sudo kill` of the imgserv
 process (should respawn within ~5s). Not yet deployed anywhere.
 
-## The hang/continuous-error-loop case: designed and validated against a real example
+## The hang/continuous-error-loop case: `pipeline_watchdog.sh`
 
-`pipeline_watchdog.sh` + `rtsp-seek-server.service` + `pipeline-watchdog.service` (this directory).
+**Course correction (2026-10-20, important for anyone picking this up later):** the first design
+replaced the pipeline's own startup with a systemd service (`Type=simple`, porting `usbreset` +
+PID-file-clear into `ExecStartPre`). That was the wrong scope for what was actually asked -
+"add automatic recovery," not "rebuild how the pipeline starts." It also kept surfacing new gaps
+from re-implementing logic the existing wrapper already does correctly (missing
+`GST_PLUGIN_PATH`, missing the `image.head.seek`/`image.head.boson` copy step, a boot-grace-period
+bug). **Pulled back to a purely additive design instead:** `system_init.sh` and the existing
+pipeline wrapper scripts are completely untouched. `pipeline_watchdog.sh` only detects problems and
+calls the camera's own already-working `pipeline_restart.sh` when it finds one - no reimplementation
+of startup logic, no risk to the proven startup sequence, and removing the watchdog later is just
+stopping one process, nothing else to undo.
 
-**Design:** `rtsp-seek-server` moves from the old shell while-loop into its own systemd service
-(`Type=simple` - it runs in the foreground, no daemonizing, so no `PIDFile=` needed for systemd's
-own tracking; the `/var/run/rtsp-seek-server.pid` file it still clears via `ExecStartPre` is a
-separate concern - whatever the binary itself checks internally on startup, same bug class as
-imgserv's stale-PID issue). `usbreset 289d:0011` also runs as an `ExecStartPre`, since Seek Thermal
-USB devices have documented history of getting stuck at the bus level, not just the process level
-(see [[project_sv126_frozen_seek_usb]]) - keeping this step is cheap insurance even without proof
-it's required on every restart.
-
-A second, separate service (`pipeline-watchdog.service`) runs `pipeline_watchdog.sh` continuously,
-polling every 30s (polling is unavoidable here - unlike imgserv, there's no process-exit event for
-a stuck-but-alive pipeline to react to). When it detects a problem, its only action is
-`systemctl restart rtsp-seek-server.service` - all the "how to restart cleanly" logic lives in the
-service definition, not duplicated in the watchdog.
+`pipeline-watchdog.service` runs `pipeline_watchdog.sh` continuously (systemd here only supervises
+the watchdog script itself - `Restart=on-failure` if the watchdog crashes - it has no dependency on
+any pipeline-specific unit). Polling (every 30s) is unavoidable - unlike imgserv, there's no
+process-exit event for a stuck-but-alive pipeline to react to.
 
 **Detection reuses `camera-check-v2.sh`'s own already-proven categories** rather than inventing new
 ones: MISSING, EMPTY (size < 1000 bytes), STALE (mtime > 60s old), REPEATING (md5sum unchanged
@@ -65,30 +65,38 @@ across consecutive polls - catches a frame frozen at the pixel level even while 
 advancing), plus a separate USB/kernel-error-log layer (>=5 matches, same threshold already used
 elsewhere) for the sv-31-style failure class.
 
-**Validated against a real live example (sv-191, 2026-10-20), not just theory:**
-- Found `image.pgm` stuck at 17 bytes - a complete PGM header (`P5 320 240\n65535\n`) with ZERO
-  pixel data ever appended, despite a fresh mtime (something keeps rewriting the header, never
-  the body).
-- `getimage.sh` (the tool the 2026-05-21 architecture doc describes as writing this file) is NOT
-  running, NOT in `system_init.sh`, NOT in either crontab - the real write mechanism on this
-  camera's current setup wasn't identified.
-- **Kernel/USB-error check: MISSED this failure completely** - `dmesg` showed 0 matching errors,
-  `lsusb` showed the Seek camera fully enumerated and healthy. The failure is pure software, not
-  hardware/USB.
-- **A naive pixel-variance check (my first draft) ALSO MISSED it** - `tail -c 200` on a 17-byte
-  file just reads the whole file, and the header text (`P5 320 240...`) has plenty of natural byte
-  variety, so it reads as "not frozen." This is exactly why the EMPTY/size check must run
-  **before and independently of** any pixel-level check, never as a secondary/redundant signal -
-  for this real failure, size was the ONLY signal of the ones tested that caught it.
-- This confirms multiple independent layers are genuinely necessary, not just thorough-for-
-  thoroughness's-sake: at least two different real fleet failures (sv-191's silent EMPTY state,
-  sv-31's loud USB-error spam) are each invisible to the other's detection method.
+**Validated against two real live examples (2026-10-20), not just theory:**
+- **sv-191 (Seek):** `image.pgm` stuck at 17 bytes - a complete PGM header (`P5 320 240\n65535\n`)
+  with ZERO pixel data ever appended, despite a fresh mtime. Kernel/USB-error check MISSED this
+  completely (`dmesg` showed 0 matches, `lsusb` showed the camera fully enumerated/healthy) - pure
+  software failure. A naive pixel-variance check (an earlier draft) ALSO missed it, since
+  `tail -c 200` on a 17-byte file just reads the header text, which has plenty of natural byte
+  variety and reads as "not frozen." This is why the EMPTY/size check must run **before and
+  independently of** any pixel-level check, never as a secondary/redundant signal.
+- **sv-200 (Boson):** found frozen too, confirming the underlying "alive but stuck, nothing exits"
+  problem isn't Seek-specific - it's a general old-pipeline-architecture gap across both camera
+  types. `rtsp-ir-server`'s wrapper (`sv-200`, live-checked) has no `usbreset` equivalent at all and
+  resolves its device via `/dev/v4l/by-id/usb-FLIR_Boson*` instead of a fixed VID:PID - confirmed
+  architectural differences, not assumed parity with Seek.
+- Together these confirm multiple independent detection layers are genuinely necessary: sv-191's
+  silent EMPTY state and sv-31's loud USB-error spam are each invisible to the other's method.
+
+**Safety additions after discussing the risk of false positives / restart loops:**
+- MISSING/EMPTY/STALE now require the same bad reading on **2 consecutive checks** before acting
+  (REPEATING already had an equivalent debounce via its hash-comparison design) - filters a single
+  noisy/transient reading instead of restarting an otherwise-healthy pipeline.
+- **Circuit breaker:** stops auto-restarting after 3 restarts within a 30-minute window, logging
+  that it needs a human instead of retrying forever - matches the existing
+  warn-then-stop-and-flag pattern already used in `camera-check-v2.sh`'s "REBOOT NEEDED" status.
+- Fixed the boot-grace-period bug: `LAST_RESTART_EPOCH` now starts at the current time instead of
+  `0`, so a freshly-started watchdog gets the same grace period a just-triggered restart does,
+  instead of judging `image.pgm` before the pipeline has had a chance to produce its first frame.
 
 **Explicit scope decision carried over from existing tooling:** `camera-check-v2.sh`'s REPEATING
 check is deliberately detection-only today (auto-restart on it "wasn't approved, 2026-09-24" per
-its own code comment) - the new watchdog currently DOES act on REPEATING (unlike the old script).
+its own code comment) - this watchdog currently DOES act on REPEATING (unlike the old script).
 Worth confirming this is the intended change before fleet deployment, not just inherited silently.
 
-**Not yet done:** deployed or tested live anywhere. sv-191 is sitting in its confirmed-broken state,
-not yet fixed (manual `pipeline_restart.sh` was proposed as both a live fix and an end-to-end test
-of the recovery action, not yet run as of this write-up).
+**Not yet done:** deployed or enabled live anywhere. `deploy_pipeline_recovery.ps1` installs the
+files but deliberately does not enable/start them - sv-191 and sv-200 are both sitting in their
+confirmed-broken state, not yet fixed.

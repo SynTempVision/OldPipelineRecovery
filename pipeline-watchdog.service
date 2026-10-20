@@ -1,22 +1,20 @@
 # /etc/systemd/system/pipeline-watchdog.service
 #
-# Runs pipeline_watchdog.sh persistently. Polling is unavoidable here
-# (unlike imgserv.service, there's no "process exit" event for a stuck-
-# but-alive pipeline to react to) - this is what creates that exit event
-# when needed, by calling `systemctl restart $PIPELINE_SERVICE` (set
-# inside the script itself).
+# Runs pipeline_watchdog.sh persistently and restarts IT if it crashes -
+# this is the only thing systemd supervises here. The watchdog script
+# itself calls pipeline_restart.sh (the already-existing, already-proven
+# recovery action) when it detects a problem - it does NOT replace or
+# depend on any systemd unit for the pipeline/imgserv themselves, since
+# those are deliberately left on their existing system_init.sh-based
+# startup, untouched.
 #
-# IMPORTANT: a camera only ever runs ONE pipeline type. On Seek cameras,
-# After=/Requires= below should say rtsp-seek-server.service (as written).
-# On Boson/FLIR cameras, change both lines to rtsp-ir-server.service AND
-# set PIPELINE_SERVICE accordingly at the top of pipeline_watchdog.sh -
-# these three references must all agree with each other and with
-# whichever pipeline is actually installed on that specific camera.
+# This is purely additive: nothing existing depends on this unit, so
+# disabling/removing it reverts the camera to exactly its original
+# behavior with no other changes needed.
 
 [Unit]
-Description=Pipeline watchdog (frame/USB health monitor for the old pipeline)
-After=rtsp-seek-server.service
-Requires=rtsp-seek-server.service
+Description=Pipeline watchdog (frame/USB health monitor, calls pipeline_restart.sh on detection)
+After=network.target
 
 [Service]
 Type=simple
