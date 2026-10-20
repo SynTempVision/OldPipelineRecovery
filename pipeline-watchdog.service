@@ -3,10 +3,18 @@
 # Runs pipeline_watchdog.sh persistently. Polling is unavoidable here
 # (unlike imgserv.service, there's no "process exit" event for a stuck-
 # but-alive pipeline to react to) - this is what creates that exit event
-# when needed, by calling `systemctl restart rtsp-seek-server.service`.
+# when needed, by calling `systemctl restart $PIPELINE_SERVICE` (set
+# inside the script itself).
+#
+# IMPORTANT: a camera only ever runs ONE pipeline type. On Seek cameras,
+# After=/Requires= below should say rtsp-seek-server.service (as written).
+# On Boson/FLIR cameras, change both lines to rtsp-ir-server.service AND
+# set PIPELINE_SERVICE accordingly at the top of pipeline_watchdog.sh -
+# these three references must all agree with each other and with
+# whichever pipeline is actually installed on that specific camera.
 
 [Unit]
-Description=Pipeline watchdog (frame/USB health monitor for rtsp-seek-server)
+Description=Pipeline watchdog (frame/USB health monitor for the old pipeline)
 After=rtsp-seek-server.service
 Requires=rtsp-seek-server.service
 

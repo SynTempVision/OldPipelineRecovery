@@ -12,6 +12,12 @@
 # ExecStartPre, since it's a start-time concern, not an ongoing-monitoring
 # one. This script only decides WHEN to restart, never how.
 
+# Which systemd service to restart on detection - a camera only ever runs
+# ONE pipeline type (Seek or Boson), never both, so this is the one thing
+# that needs to change per deployment. Set to "rtsp-ir-server.service" on
+# Boson/FLIR cameras instead.
+PIPELINE_SERVICE="rtsp-seek-server.service"
+
 RAMDISK="/usr/local/bin/camera/ramdisk/image.pgm"
 MIN_BYTES=1000          # same threshold as camera-check-v2.sh
 STALE_SECS=60           # same threshold as camera-check-v2.sh
@@ -71,8 +77,8 @@ while true; do
     fi
 
     if [ -n "$REASON" ]; then
-        echo "$(date -Iseconds) WATCHDOG: restarting pipeline - reason: $REASON" | sudo tee -a /var/log/pipeline_watchdog.log
-        sudo systemctl restart rtsp-seek-server.service
+        echo "$(date -Iseconds) WATCHDOG: restarting $PIPELINE_SERVICE - reason: $REASON" | sudo tee -a /var/log/pipeline_watchdog.log
+        sudo systemctl restart "$PIPELINE_SERVICE"
         LAST_RESTART_EPOCH=$(date +%s)
         REPEAT_COUNT=0
     fi

@@ -1,0 +1,32 @@
+# /etc/systemd/system/rtsp-ir-server.service
+#
+# Boson/FLIR equivalent of rtsp-seek-server.service. Two real differences
+# from the Seek version, both confirmed from the live wrapper script on
+# sv-200 (2026-10-20), not assumed:
+#
+#   - No usbreset step. The original rtsp-ir-server.sh wrapper never does
+#     one (unlike Seek's unconditional `usbreset 289d:0011` every loop
+#     iteration) - not added here either, since there's no evidence it's
+#     needed for Boson. Add `ExecStartPre=/usr/bin/usbreset 09cb:4007` if
+#     Boson units are later found to get stuck at the USB level too.
+#   - Dynamic device path, not a fixed argument - the device node is
+#     resolved via `/dev/v4l/by-id/usb-FLIR_Boson*` each start, same as
+#     the original wrapper re-resolved it every loop iteration. ExecStart
+#     can't do command substitution directly, hence the bash -c wrapper.
+
+[Unit]
+Description=rtsp-ir-server (old pipeline, FLIR Boson thermal camera)
+After=network.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/rm -f /var/run/rtsp-ir-server.pid
+ExecStart=/bin/bash -c '/usr/local/bin/camera/rtsp-ir-server -s 2 -d $(ls /dev/v4l/by-id/usb-FLIR_Boson* | head -n1) -c -v'
+Restart=on-failure
+RestartSec=5
+User=root
+StandardOutput=append:/var/log/rtsp-ir-server.log
+StandardError=append:/var/log/rtsp-ir-server.log
+
+[Install]
+WantedBy=multi-user.target
